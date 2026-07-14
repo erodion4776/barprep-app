@@ -1,39 +1,13 @@
-# ===========================
-# Web Framework
-# ===========================
-fastapi==0.110.3
-uvicorn==0.29.0
-
-# ===========================
-# Database
-# ===========================
-supabase==2.4.6
-
-# ===========================
-# AI / LLM Providers
-# ===========================
-groq==0.9.0
-
-# ===========================
-# Search
-# ===========================
+# Use newer pydantic that has Python 3.11 wheels
+fastapi==0.115.5
+uvicorn==0.32.1
+supabase==2.10.0
+groq==0.13.1
 duckduckgo-search==3.9.6
-
-# ===========================
-# Web Scraping
-# ===========================
 beautifulsoup4==4.12.3
-lxml==5.2.2
-requests==2.31.0
-
-# ===========================
-# YouTube
-# ===========================
+lxml==5.3.0
+requests==2.32.3
 youtube-transcript-api==0.6.2
-
-# ===========================
-# Utilities
-# ===========================
 python-dotenv==1.0.1
-pydantic==2.6.4
-typing-extensions==4.11.0
+pydantic==2.10.3
+typing-extensions==4.12.2
