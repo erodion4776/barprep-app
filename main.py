@@ -46,14 +46,6 @@ except ImportError:
     DDGS_AVAILABLE = False
     logger.warning("duckduckgo-search not available. Web search disabled.")
 
-try:
-    from sentence_transformers import SentenceTransformer
-    ST_AVAILABLE = True
-    logger.info("sentence-transformers available as embedding fallback.")
-except ImportError:
-    ST_AVAILABLE = False
-    logger.warning("sentence-transformers not installed. Local fallback disabled.")
-
 # ---- Environment ----
 load_dotenv()
 SUPABASE_URL    = os.getenv("SUPABASE_URL")
@@ -80,15 +72,6 @@ if GROQ_API_KEY and GROQ_AVAILABLE:
     groq_client = Groq(api_key=GROQ_API_KEY)
     logger.info("Groq client initialized.")
 
-# Initialize local embedding model once at startup if available
-local_embedding_model = None
-if ST_AVAILABLE:
-    try:
-        local_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-        logger.info("Local SentenceTransformer model loaded successfully.")
-    except Exception as e:
-        logger.warning(f"Failed to load local embedding model: {e}")
-
 # ---- Configuration Constants ----
 HF_EMBED_URL      = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
 POLLINATIONS_URL  = "https://text.pollinations.ai"
@@ -108,7 +91,6 @@ async def lifespan(app: FastAPI):
     logger.info(f"Groq Ready: {groq_client is not None}")
     logger.info(f"HF Token Set: {bool(HF_TOKEN)}")
     logger.info(f"DDG Search Available: {DDGS_AVAILABLE}")
-    logger.info(f"Local Embedding Model Ready: {local_embedding_model is not None}")
     yield
     logger.info("BarPrep AI Backend shutting down.")
 
@@ -183,53 +165,68 @@ def sanitize_for_prompt(text: str) -> str:
 
 def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
-    Generates embeddings with two layers:
-    1. HuggingFace API (primary - free)
-    2. Local sentence-transformers (fallback)
+    Generates embeddings via HuggingFace API.
+    Retries up to 3 times on failure with
+    increasing wait times between attempts.
     """
     clean_texts = [t.replace("\n", " ").strip() for t in texts]
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
-    # --- Primary: HuggingFace API ---
-    try:
-        headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-        response = requests.post(
-            HF_EMBED_URL,
-            headers=headers,
-            json={
-                "inputs": clean_texts,
-                "options": {"wait_for_model": True}
-            },
-            timeout=60  # Increased timeout
-        )
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list) and len(result) > 0:
-                logger.info("Embeddings generated via HuggingFace API.")
-                return result
-    except Exception as e:
-        logger.warning(
-            f"HuggingFace API failed: {e}. "
-            f"Trying local fallback..."
-        )
-
-    # --- Fallback: Local sentence-transformers ---
-    if local_embedding_model is not None:
+    for attempt in range(3):
         try:
-            logger.info("Using local SentenceTransformer fallback...")
-            embeddings = local_embedding_model.encode(
-                clean_texts,
-                normalize_embeddings=True
+            response = requests.post(
+                HF_EMBED_URL,
+                headers=headers,
+                json={
+                    "inputs": clean_texts,
+                    "options": {"wait_for_model": True}
+                },
+                timeout=60
             )
-            return embeddings.tolist()
-        except Exception as e:
-            logger.error(f"Local embedding fallback failed: {e}")
 
-    # --- Both failed ---
+            if response.status_code == 200:
+                result = response.json()
+                if isinstance(result, list) and len(result) > 0:
+                    logger.info("Embeddings generated via HuggingFace API.")
+                    return result
+
+            # Model still loading on HuggingFace
+            if response.status_code == 503:
+                wait_time = (attempt + 1) * 10
+                logger.warning(
+                    f"HuggingFace model loading. "
+                    f"Attempt {attempt + 1}/3. "
+                    f"Waiting {wait_time}s..."
+                )
+                time.sleep(wait_time)
+                continue
+
+            logger.error(
+                f"HuggingFace API error: "
+                f"{response.status_code} - {response.text}"
+            )
+
+        except requests.exceptions.ConnectionError as e:
+            wait_time = (attempt + 1) * 5
+            logger.warning(
+                f"HuggingFace connection failed. "
+                f"Attempt {attempt + 1}/3. "
+                f"Waiting {wait_time}s... "
+                f"Error: {e}"
+            )
+            time.sleep(wait_time)
+            continue
+
+        except Exception as e:
+            logger.error(f"Embedding attempt {attempt + 1} failed: {e}")
+            if attempt < 2:
+                time.sleep((attempt + 1) * 3)
+                continue
+
     raise HTTPException(
         status_code=500,
         detail=(
-            "Embedding service unavailable. "
-            "Both HuggingFace API and local fallback failed. "
+            "Embedding service temporarily unavailable. "
             "Please try again in a few minutes."
         )
     )
@@ -239,7 +236,7 @@ def get_embeddings_with_retry(
     texts: List[str],
     max_retries: int = 3
 ) -> List[List[float]]:
-    """Wraps get_embeddings_batch with retry logic."""
+    """Wraps get_embeddings_batch with outer retry logic."""
     last_error = None
     for attempt in range(max_retries):
         try:
@@ -248,10 +245,10 @@ def get_embeddings_with_retry(
             if e.status_code != 500:
                 raise
             last_error = e
-            wait_time = (attempt + 1) * 3  # 3s, 6s, 9s
+            wait_time = (attempt + 1) * 3
             logger.warning(
-                f"Embedding attempt {attempt + 1}/{max_retries} "
-                f"failed. Waiting {wait_time}s..."
+                f"Embedding retry {attempt + 1}/{max_retries}. "
+                f"Waiting {wait_time}s..."
             )
             time.sleep(wait_time)
 
@@ -320,7 +317,6 @@ def health_check():
         "hf_token_set": bool(HF_TOKEN),
         "supabase_connected": bool(supabase),
         "web_search_available": DDGS_AVAILABLE,
-        "local_embedding_ready": local_embedding_model is not None,
     }
 
 
@@ -424,7 +420,7 @@ def ingest_youtube(data: IngestRequest):
         )
     video_id = match.group(1)
 
-    # Retry up to 3 times with delay for rate limits
+    # Retry up to 3 times for rate limits
     transcript_list = None
     last_error = None
 
@@ -448,9 +444,9 @@ def ingest_youtube(data: IngestRequest):
 
             # Rate limit - wait and retry
             if "429" in str(e) or "too many requests" in error_str:
-                wait_time = (attempt + 1) * 5  # 5s, 10s, 15s
+                wait_time = (attempt + 1) * 5
                 logger.warning(
-                    f"YouTube rate limit. "
+                    f"YouTube rate limit hit. "
                     f"Attempt {attempt + 1}/3. "
                     f"Waiting {wait_time}s..."
                 )
@@ -469,7 +465,7 @@ def ingest_youtube(data: IngestRequest):
                     detail="Video unavailable or private."
                 )
 
-            # Unknown error - no retry
+            # Unknown error
             raise HTTPException(
                 status_code=500,
                 detail=f"Transcript error: {e}"
