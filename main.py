@@ -44,17 +44,17 @@ try:
     DDGS_AVAILABLE = True
 except ImportError:
     DDGS_AVAILABLE = False
-    logger.warning("duckduckgo-search not available. Web search fallback disabled.")
+    logger.warning("duckduckgo-search not available. Web search disabled.")
 
 # ---- Environment ----
 load_dotenv()
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-HF_TOKEN     = os.getenv("HF_TOKEN")
+SUPABASE_URL    = os.getenv("SUPABASE_URL")
+SUPABASE_KEY    = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
+HF_TOKEN        = os.getenv("HF_TOKEN")
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    "http://localhost:5173,http://localhost:3000"
+    "https://barprepfront.netlify.app,http://localhost:5173,http://localhost:3000"
 ).split(",")
 
 if not all([SUPABASE_URL, SUPABASE_KEY]):
@@ -66,7 +66,7 @@ if not GROQ_API_KEY:
 # ---- Client Initialization ----
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Initialize Groq once at startup - not per request
+# Initialize Groq once at startup
 groq_client = None
 if GROQ_API_KEY and GROQ_AVAILABLE:
     groq_client = Groq(api_key=GROQ_API_KEY)
@@ -96,12 +96,15 @@ async def lifespan(app: FastAPI):
 
 # ---- App Init ----
 app = FastAPI(title="BarPrep AI Backend", lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
 )
 
 # ---- Schemas ----
@@ -155,11 +158,13 @@ class ChatRequest(BaseModel):
 
 # ---- Helpers ----
 def sanitize_for_prompt(text: str) -> str:
+    """Prevents prompt injection via ingested content."""
     text = text.replace("===", "---")
     return text[:8000]
 
 
 def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
+    """Generates 384-dim embeddings via HuggingFace in batches."""
     clean_texts = [t.replace("\n", " ").strip() for t in texts]
     headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
     response = requests.post(
@@ -181,6 +186,7 @@ def split_text(
     chunk_size: int = CHUNK_SIZE,
     overlap: int = CHUNK_OVERLAP
 ) -> List[str]:
+    """Splits text into overlapping chunks."""
     if not text or not text.strip():
         return []
     if overlap >= chunk_size:
@@ -193,15 +199,11 @@ def split_text(
 
 
 def run_web_search(query: str) -> str:
-    """
-    Runs DuckDuckGo search with compatibility
-    for both old and new package versions.
-    """
+    """Runs DuckDuckGo search with version compatibility."""
     if not DDGS_AVAILABLE:
         return ""
     try:
         with DDGS() as ddgs:
-            # Version 3.x syntax - works without Rust
             hits = list(ddgs.text(
                 query,
                 region="wt-wt",
@@ -221,6 +223,7 @@ def run_web_search(query: str) -> str:
 
 
 # ---- Endpoints ----
+
 @app.get("/")
 def home():
     return {"status": "healthy", "service": "BarPrep AI Engine"}
@@ -239,6 +242,7 @@ def health_check():
 
 @app.post("/api/ingest/url")
 def ingest_url(data: IngestRequest):
+    """Scrapes a webpage and ingests it into Supabase vector store."""
     url = data.url
     try:
         res = requests.get(
@@ -264,7 +268,10 @@ def ingest_url(data: IngestRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not reach URL: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not reach URL: {e}"
+        )
 
     for tag in soup(["script", "style"]):
         tag.extract()
@@ -278,6 +285,7 @@ def ingest_url(data: IngestRequest):
     clean_text = "\n".join(
         line.strip() for line in soup.get_text().splitlines() if line.strip()
     )
+
     chunks = split_text(clean_text)
     if not chunks:
         return {"message": "Page contained no readable text."}
@@ -291,7 +299,10 @@ def ingest_url(data: IngestRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Embedding failed: {e}"
+        )
 
     rows = [{
         "content": chunk,
@@ -307,32 +318,56 @@ def ingest_url(data: IngestRequest):
     try:
         supabase.table("documents").insert(rows).execute()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"DB insert failed: {e}"
+        )
 
     logger.info(f"Ingested {len(chunks)} chunks from '{title}'")
-    return {"message": f"Successfully ingested {len(chunks)} chunks from '{title}'"}
+    return {
+        "message": f"Successfully ingested {len(chunks)} chunks from '{title}'"
+    }
 
 
 @app.post("/api/ingest/youtube")
 def ingest_youtube(data: IngestRequest):
+    """Transcribes a YouTube video and ingests it into Supabase."""
     match = re.search(r"(?:v=|\/)([a-zA-Z0-9_-]{11})", data.url)
     if not match:
-        raise HTTPException(status_code=400, detail="Invalid YouTube URL.")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid YouTube URL."
+        )
     video_id = match.group(1)
 
     try:
         transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
         full_transcript = " ".join(e["text"] for e in transcript_list)
     except TranscriptsDisabled:
-        raise HTTPException(status_code=400, detail="Transcripts disabled.")
+        raise HTTPException(
+            status_code=400,
+            detail="Transcripts disabled for this video."
+        )
     except NoTranscriptFound:
-        raise HTTPException(status_code=404, detail="No transcript found.")
+        raise HTTPException(
+            status_code=404,
+            detail="No transcript found for this video."
+        )
     except Exception as e:
         if HAS_VIDEO_UNAVAILABLE and isinstance(e, VideoUnavailable):
-            raise HTTPException(status_code=404, detail="Video unavailable.")
+            raise HTTPException(
+                status_code=404,
+                detail="Video unavailable or private."
+            )
         if any(k in str(e).lower() for k in ["unavailable", "private"]):
-            raise HTTPException(status_code=404, detail="Video unavailable.")
-        raise HTTPException(status_code=500, detail=f"Transcript error: {e}")
+            raise HTTPException(
+                status_code=404,
+                detail="Video unavailable or private."
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Transcript error: {e}"
+        )
 
     try:
         supabase.table("youtube_videos").upsert({
@@ -348,7 +383,9 @@ def ingest_youtube(data: IngestRequest):
 
     chunks = split_text(full_transcript)
     if not chunks:
-        return {"message": f"Video {video_id} had no usable transcript text."}
+        return {
+            "message": f"Video {video_id} had no usable transcript text."
+        }
 
     if len(chunks) > MAX_CHUNKS:
         chunks = chunks[:MAX_CHUNKS]
@@ -359,7 +396,10 @@ def ingest_youtube(data: IngestRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Embedding failed: {e}"
+        )
 
     rows = [{
         "content": chunk,
@@ -375,14 +415,21 @@ def ingest_youtube(data: IngestRequest):
     try:
         supabase.table("documents").insert(rows).execute()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"DB insert failed: {e}"
+        )
 
     logger.info(f"Processed video {video_id} into {len(chunks)} chunks.")
-    return {"message": f"Processed video {video_id} into {len(chunks)} chunks."}
+    return {
+        "message": f"Processed video {video_id} into {len(chunks)} chunks."
+    }
 
 
 @app.post("/api/chat")
 def chat_with_ai(data: ChatRequest):
+    """Answers bar exam questions using RAG + AI."""
+
     # 1. Embed the query
     try:
         query_vector = get_embeddings_batch([data.message])[0]
@@ -426,13 +473,15 @@ Explain step-by-step with clear legal reasoning when needed.
 === INTERNAL STUDY MATERIAL CONTEXT ===
 {context_text}{web_section}
 """
+
+    # 5. Assemble messages
     messages = (
         [{"role": "system", "content": system_prompt}]
         + [{"role": m.role, "content": m.content} for m in data.history]
         + [{"role": "user", "content": data.message}]
     )
 
-    # 5. Try Pollinations first (free)
+    # 6. Try Pollinations first (free)
     try:
         res = requests.post(POLLINATIONS_URL, json={
             "messages": messages,
@@ -444,7 +493,7 @@ Explain step-by-step with clear legal reasoning when needed.
     except Exception as e:
         logger.error(f"Pollinations failed: {e}")
 
-    # 6. Groq fallback
+    # 7. Groq fallback
     if groq_client:
         try:
             completion = groq_client.chat.completions.create(
@@ -453,7 +502,10 @@ Explain step-by-step with clear legal reasoning when needed.
             )
             return {"reply": completion.choices[0].message.content.strip()}
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Groq failed: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Groq failed: {e}"
+            )
 
     raise HTTPException(
         status_code=500,
@@ -463,6 +515,7 @@ Explain step-by-step with clear legal reasoning when needed.
 
 @app.get("/api/affirmation")
 def get_daily_affirmation():
+    """Generates a daily bar exam affirmation."""
     try:
         res = requests.post(POLLINATIONS_URL, json={
             "messages": [
