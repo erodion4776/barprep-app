@@ -10,7 +10,6 @@ from pydantic import BaseModel, field_validator
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from duckduckgo_search import DDGS
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
     TranscriptsDisabled,
@@ -38,6 +37,14 @@ try:
 except ImportError:
     GROQ_AVAILABLE = False
     logger.warning("groq package not installed. Groq fallback disabled.")
+
+# DuckDuckGo - safely imported with version compatibility
+try:
+    from duckduckgo_search import DDGS
+    DDGS_AVAILABLE = True
+except ImportError:
+    DDGS_AVAILABLE = False
+    logger.warning("duckduckgo-search not available. Web search fallback disabled.")
 
 # ---- Environment ----
 load_dotenv()
@@ -83,6 +90,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"CORS Origins: {ALLOWED_ORIGINS}")
     logger.info(f"Groq Ready: {groq_client is not None}")
     logger.info(f"HF Token Set: {bool(HF_TOKEN)}")
+    logger.info(f"DDG Search Available: {DDGS_AVAILABLE}")
     yield
     logger.info("BarPrep AI Backend shutting down.")
 
@@ -144,6 +152,7 @@ class ChatRequest(BaseModel):
             raise ValueError("History too long (max 20 messages)")
         return v
 
+
 # ---- Helpers ----
 def sanitize_for_prompt(text: str) -> str:
     text = text.replace("===", "---")
@@ -182,6 +191,35 @@ def split_text(
         start += step
     return chunks
 
+
+def run_web_search(query: str) -> str:
+    """
+    Runs DuckDuckGo search with compatibility
+    for both old and new package versions.
+    """
+    if not DDGS_AVAILABLE:
+        return ""
+    try:
+        with DDGS() as ddgs:
+            # Version 3.x syntax - works without Rust
+            hits = list(ddgs.text(
+                query,
+                region="wt-wt",
+                safesearch="off",
+                max_results=3
+            ))
+            if not hits:
+                return ""
+            return "\n\n".join(
+                f"Source: {h.get('href', h.get('link', ''))}\n"
+                f"Snippet: {h.get('body', h.get('snippet', ''))}"
+                for h in hits
+            )
+    except Exception as e:
+        logger.error(f"DuckDuckGo search failed: {e}")
+        return ""
+
+
 # ---- Endpoints ----
 @app.get("/")
 def home():
@@ -195,6 +233,7 @@ def health_check():
         "groq_available": groq_client is not None,
         "hf_token_set": bool(HF_TOKEN),
         "supabase_connected": bool(supabase),
+        "web_search_available": DDGS_AVAILABLE,
     }
 
 
@@ -202,17 +241,25 @@ def health_check():
 def ingest_url(data: IngestRequest):
     url = data.url
     try:
-        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"},
-                           timeout=10, stream=True)
+        res = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+            stream=True
+        )
         if res.status_code != 200:
-            raise HTTPException(status_code=400,
-                detail=f"Page returned status {res.status_code}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Page returned status {res.status_code}"
+            )
         content = b""
         for chunk in res.iter_content(chunk_size=8192):
             content += chunk
             if len(content) > MAX_CONTENT_BYTES:
-                raise HTTPException(status_code=400,
-                    detail=f"Page too large (max {MAX_CONTENT_BYTES // (1024*1024)}MB)")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Page too large (max {MAX_CONTENT_BYTES // (1024*1024)}MB)"
+                )
         soup = BeautifulSoup(content, "html.parser")
     except HTTPException:
         raise
@@ -222,9 +269,11 @@ def ingest_url(data: IngestRequest):
     for tag in soup(["script", "style"]):
         tag.extract()
 
-    # Sanitize title
-    title = (soup.title.string.strip()[:200]
-             if soup.title and soup.title.string else "Untitled Page")
+    title = (
+        soup.title.string.strip()[:200]
+        if soup.title and soup.title.string
+        else "Untitled Page"
+    )
 
     clean_text = "\n".join(
         line.strip() for line in soup.get_text().splitlines() if line.strip()
@@ -246,8 +295,12 @@ def ingest_url(data: IngestRequest):
 
     rows = [{
         "content": chunk,
-        "metadata": {"source": url, "title": title,
-                     "type": "webpage", "chunk_index": i},
+        "metadata": {
+            "source": url,
+            "title": title,
+            "type": "webpage",
+            "chunk_index": i
+        },
         "embedding": embeddings[i]
     } for i, chunk in enumerate(chunks)]
 
@@ -288,7 +341,10 @@ def ingest_youtube(data: IngestRequest):
             "transcript": full_transcript
         }).execute()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Metadata DB insert failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Metadata DB insert failed: {e}"
+        )
 
     chunks = split_text(full_transcript)
     if not chunks:
@@ -307,9 +363,12 @@ def ingest_youtube(data: IngestRequest):
 
     rows = [{
         "content": chunk,
-        "metadata": {"source": f"https://youtube.com/watch?v={video_id}",
-                     "video_id": video_id, "type": "youtube_transcript",
-                     "chunk_index": i},
+        "metadata": {
+            "source": f"https://youtube.com/watch?v={video_id}",
+            "video_id": video_id,
+            "type": "youtube_transcript",
+            "chunk_index": i
+        },
         "embedding": embeddings[i]
     } for i, chunk in enumerate(chunks)]
 
@@ -324,11 +383,16 @@ def ingest_youtube(data: IngestRequest):
 
 @app.post("/api/chat")
 def chat_with_ai(data: ChatRequest):
+    # 1. Embed the query
     try:
         query_vector = get_embeddings_batch([data.message])[0]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Query embedding failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query embedding failed: {e}"
+        )
 
+    # 2. RAG search with graceful degradation
     try:
         result = supabase.rpc("match_documents", {
             "query_embedding": query_vector,
@@ -340,17 +404,12 @@ def chat_with_ai(data: ChatRequest):
         logger.error(f"RAG search failed: {e}")
         context_chunks = []
 
+    # 3. Web search fallback if RAG found nothing
     web_results = ""
     if not context_chunks:
-        try:
-            with DDGS() as ddgs:
-                hits = list(ddgs.text(data.message, max_results=3))
-                web_results = "\n\n".join(
-                    f"Source: {h['href']}\nSnippet: {h['body']}" for h in hits
-                )
-        except Exception as e:
-            logger.error(f"DuckDuckGo search failed: {e}")
+        web_results = run_web_search(data.message)
 
+    # 4. Build prompt
     context_text = sanitize_for_prompt(
         "\n---\n".join(context_chunks) if context_chunks
         else "No relevant internal context found."
@@ -373,26 +432,33 @@ Explain step-by-step with clear legal reasoning when needed.
         + [{"role": "user", "content": data.message}]
     )
 
+    # 5. Try Pollinations first (free)
     try:
         res = requests.post(POLLINATIONS_URL, json={
-            "messages": messages, "model": "openai", "private": True
+            "messages": messages,
+            "model": "openai",
+            "private": True
         }, timeout=30)
         if res.status_code == 200 and (reply := res.text.strip()):
             return {"reply": reply}
     except Exception as e:
         logger.error(f"Pollinations failed: {e}")
 
+    # 6. Groq fallback
     if groq_client:
         try:
             completion = groq_client.chat.completions.create(
-                messages=messages, model=GROQ_MODEL
+                messages=messages,
+                model=GROQ_MODEL
             )
             return {"reply": completion.choices[0].message.content.strip()}
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Groq failed: {e}")
 
-    raise HTTPException(status_code=500,
-        detail="All LLM services temporarily unavailable.")
+    raise HTTPException(
+        status_code=500,
+        detail="All LLM services temporarily unavailable."
+    )
 
 
 @app.get("/api/affirmation")
@@ -400,8 +466,14 @@ def get_daily_affirmation():
     try:
         res = requests.post(POLLINATIONS_URL, json={
             "messages": [
-                {"role": "system", "content": "You are an inspiring mentor to future lawyers."},
-                {"role": "user", "content": "Give a short 2-3 sentence bar exam affirmation."}
+                {
+                    "role": "system",
+                    "content": "You are an inspiring mentor to future lawyers."
+                },
+                {
+                    "role": "user",
+                    "content": "Give a short 2-3 sentence bar exam affirmation."
+                }
             ],
             "model": "openai"
         }, timeout=15)
@@ -410,4 +482,6 @@ def get_daily_affirmation():
     except Exception as e:
         logger.error(f"Affirmation generation failed: {e}")
 
-    return {"affirmation": "You have the analytical mind, the diligence, and the capability to conquer this exam. One rule, one analysis, and one day at a time."}
+    return {
+        "affirmation": "You have the analytical mind, the diligence, and the capability to conquer this exam. One rule, one analysis, and one day at a time."
+    }
