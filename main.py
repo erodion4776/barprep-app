@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import logging
 import requests
 from contextlib import asynccontextmanager
@@ -38,13 +39,20 @@ except ImportError:
     GROQ_AVAILABLE = False
     logger.warning("groq package not installed. Groq fallback disabled.")
 
-# DuckDuckGo - safely imported with version compatibility
 try:
     from duckduckgo_search import DDGS
     DDGS_AVAILABLE = True
 except ImportError:
     DDGS_AVAILABLE = False
     logger.warning("duckduckgo-search not available. Web search disabled.")
+
+try:
+    from sentence_transformers import SentenceTransformer
+    ST_AVAILABLE = True
+    logger.info("sentence-transformers available as embedding fallback.")
+except ImportError:
+    ST_AVAILABLE = False
+    logger.warning("sentence-transformers not installed. Local fallback disabled.")
 
 # ---- Environment ----
 load_dotenv()
@@ -72,6 +80,15 @@ if GROQ_API_KEY and GROQ_AVAILABLE:
     groq_client = Groq(api_key=GROQ_API_KEY)
     logger.info("Groq client initialized.")
 
+# Initialize local embedding model once at startup if available
+local_embedding_model = None
+if ST_AVAILABLE:
+    try:
+        local_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+        logger.info("Local SentenceTransformer model loaded successfully.")
+    except Exception as e:
+        logger.warning(f"Failed to load local embedding model: {e}")
+
 # ---- Configuration Constants ----
 HF_EMBED_URL      = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
 POLLINATIONS_URL  = "https://text.pollinations.ai"
@@ -91,6 +108,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Groq Ready: {groq_client is not None}")
     logger.info(f"HF Token Set: {bool(HF_TOKEN)}")
     logger.info(f"DDG Search Available: {DDGS_AVAILABLE}")
+    logger.info(f"Local Embedding Model Ready: {local_embedding_model is not None}")
     yield
     logger.info("BarPrep AI Backend shutting down.")
 
@@ -164,20 +182,85 @@ def sanitize_for_prompt(text: str) -> str:
 
 
 def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
-    """Generates 384-dim embeddings via HuggingFace in batches."""
+    """
+    Generates embeddings with two layers:
+    1. HuggingFace API (primary - free)
+    2. Local sentence-transformers (fallback)
+    """
     clean_texts = [t.replace("\n", " ").strip() for t in texts]
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-    response = requests.post(
-        HF_EMBED_URL,
-        headers=headers,
-        json={"inputs": clean_texts, "options": {"wait_for_model": True}},
-        timeout=30
-    )
-    if response.status_code == 200:
-        return response.json()
+
+    # --- Primary: HuggingFace API ---
+    try:
+        headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+        response = requests.post(
+            HF_EMBED_URL,
+            headers=headers,
+            json={
+                "inputs": clean_texts,
+                "options": {"wait_for_model": True}
+            },
+            timeout=60  # Increased timeout
+        )
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                logger.info("Embeddings generated via HuggingFace API.")
+                return result
+    except Exception as e:
+        logger.warning(
+            f"HuggingFace API failed: {e}. "
+            f"Trying local fallback..."
+        )
+
+    # --- Fallback: Local sentence-transformers ---
+    if local_embedding_model is not None:
+        try:
+            logger.info("Using local SentenceTransformer fallback...")
+            embeddings = local_embedding_model.encode(
+                clean_texts,
+                normalize_embeddings=True
+            )
+            return embeddings.tolist()
+        except Exception as e:
+            logger.error(f"Local embedding fallback failed: {e}")
+
+    # --- Both failed ---
     raise HTTPException(
         status_code=500,
-        detail=f"Embedding failed: {response.status_code} - {response.text}"
+        detail=(
+            "Embedding service unavailable. "
+            "Both HuggingFace API and local fallback failed. "
+            "Please try again in a few minutes."
+        )
+    )
+
+
+def get_embeddings_with_retry(
+    texts: List[str],
+    max_retries: int = 3
+) -> List[List[float]]:
+    """Wraps get_embeddings_batch with retry logic."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return get_embeddings_batch(texts)
+        except HTTPException as e:
+            if e.status_code != 500:
+                raise
+            last_error = e
+            wait_time = (attempt + 1) * 3  # 3s, 6s, 9s
+            logger.warning(
+                f"Embedding attempt {attempt + 1}/{max_retries} "
+                f"failed. Waiting {wait_time}s..."
+            )
+            time.sleep(wait_time)
+
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            f"Embedding failed after {max_retries} attempts. "
+            f"Last error: {last_error}"
+        )
     )
 
 
@@ -237,6 +320,7 @@ def health_check():
         "hf_token_set": bool(HF_TOKEN),
         "supabase_connected": bool(supabase),
         "web_search_available": DDGS_AVAILABLE,
+        "local_embedding_ready": local_embedding_model is not None,
     }
 
 
@@ -295,7 +379,7 @@ def ingest_url(data: IngestRequest):
         logger.warning(f"Ingestion truncated to {MAX_CHUNKS} chunks.")
 
     try:
-        embeddings = get_embeddings_batch(chunks)
+        embeddings = get_embeddings_with_retry(chunks)
     except HTTPException:
         raise
     except Exception as e:
@@ -340,34 +424,68 @@ def ingest_youtube(data: IngestRequest):
         )
     video_id = match.group(1)
 
-    try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-        full_transcript = " ".join(e["text"] for e in transcript_list)
-    except TranscriptsDisabled:
-        raise HTTPException(
-            status_code=400,
-            detail="Transcripts disabled for this video."
-        )
-    except NoTranscriptFound:
-        raise HTTPException(
-            status_code=404,
-            detail="No transcript found for this video."
-        )
-    except Exception as e:
-        if HAS_VIDEO_UNAVAILABLE and isinstance(e, VideoUnavailable):
+    # Retry up to 3 times with delay for rate limits
+    transcript_list = None
+    last_error = None
+
+    for attempt in range(3):
+        try:
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+            break
+        except TranscriptsDisabled:
+            raise HTTPException(
+                status_code=400,
+                detail="Transcripts disabled for this video."
+            )
+        except NoTranscriptFound:
             raise HTTPException(
                 status_code=404,
-                detail="Video unavailable or private."
+                detail="No transcript found for this video."
             )
-        if any(k in str(e).lower() for k in ["unavailable", "private"]):
+        except Exception as e:
+            last_error = e
+            error_str = str(e).lower()
+
+            # Rate limit - wait and retry
+            if "429" in str(e) or "too many requests" in error_str:
+                wait_time = (attempt + 1) * 5  # 5s, 10s, 15s
+                logger.warning(
+                    f"YouTube rate limit. "
+                    f"Attempt {attempt + 1}/3. "
+                    f"Waiting {wait_time}s..."
+                )
+                time.sleep(wait_time)
+                continue
+
+            # Video unavailable
+            if HAS_VIDEO_UNAVAILABLE and isinstance(e, VideoUnavailable):
+                raise HTTPException(
+                    status_code=404,
+                    detail="Video unavailable or private."
+                )
+            if any(k in error_str for k in ["unavailable", "private"]):
+                raise HTTPException(
+                    status_code=404,
+                    detail="Video unavailable or private."
+                )
+
+            # Unknown error - no retry
             raise HTTPException(
-                status_code=404,
-                detail="Video unavailable or private."
+                status_code=500,
+                detail=f"Transcript error: {e}"
             )
+
+    # All retries exhausted
+    if transcript_list is None:
         raise HTTPException(
-            status_code=500,
-            detail=f"Transcript error: {e}"
+            status_code=429,
+            detail=(
+                "YouTube is rate limiting requests. "
+                "Please wait 5 minutes and try again."
+            )
         )
+
+    full_transcript = " ".join(e["text"] for e in transcript_list)
 
     try:
         supabase.table("youtube_videos").upsert({
@@ -392,7 +510,7 @@ def ingest_youtube(data: IngestRequest):
         logger.warning(f"YouTube truncated to {MAX_CHUNKS} chunks.")
 
     try:
-        embeddings = get_embeddings_batch(chunks)
+        embeddings = get_embeddings_with_retry(chunks)
     except HTTPException:
         raise
     except Exception as e:
@@ -432,7 +550,7 @@ def chat_with_ai(data: ChatRequest):
 
     # 1. Embed the query
     try:
-        query_vector = get_embeddings_batch([data.message])[0]
+        query_vector = get_embeddings_with_retry([data.message])[0]
     except Exception as e:
         raise HTTPException(
             status_code=500,
