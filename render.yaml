@@ -4,7 +4,8 @@ services:
     runtime: python
     region: oregon
     plan: free
-    buildCommand: pip install -r requirements.txt
+    pythonVersion: "3.11.9"
+    buildCommand: pip install -r requirements.txt --only-binary=:all:
     startCommand: uvicorn main:app --host 0.0.0.0 --port 8000
     envVars:
       - key: SUPABASE_URL
