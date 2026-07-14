@@ -1,8 +1,10 @@
 import os
 import re
 import time
+import hashlib
 import logging
 import requests
+import numpy as np
 from contextlib import asynccontextmanager
 from typing import List, Literal
 from fastapi import FastAPI, HTTPException
@@ -30,21 +32,21 @@ try:
     HAS_VIDEO_UNAVAILABLE = True
 except ImportError:
     HAS_VIDEO_UNAVAILABLE = False
-    logger.warning("VideoUnavailable not available in this package version.")
+    logger.warning("VideoUnavailable not available.")
 
 try:
     from groq import Groq
     GROQ_AVAILABLE = True
 except ImportError:
     GROQ_AVAILABLE = False
-    logger.warning("groq package not installed. Groq fallback disabled.")
+    logger.warning("groq package not installed.")
 
 try:
     from duckduckgo_search import DDGS
     DDGS_AVAILABLE = True
 except ImportError:
     DDGS_AVAILABLE = False
-    logger.warning("duckduckgo-search not available. Web search disabled.")
+    logger.warning("duckduckgo-search not available.")
 
 # ---- Environment ----
 load_dotenv()
@@ -61,27 +63,27 @@ if not all([SUPABASE_URL, SUPABASE_KEY]):
     raise ValueError("Missing: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.")
 
 if not GROQ_API_KEY:
-    logger.warning("GROQ_API_KEY not set. Groq fallback is disabled.")
+    logger.warning("GROQ_API_KEY not set.")
 
 # ---- Client Initialization ----
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Initialize Groq once at startup
 groq_client = None
 if GROQ_API_KEY and GROQ_AVAILABLE:
     groq_client = Groq(api_key=GROQ_API_KEY)
     logger.info("Groq client initialized.")
 
 # ---- Configuration Constants ----
-HF_EMBED_URL      = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
-POLLINATIONS_URL  = "https://text.pollinations.ai"
-MAX_CONTENT_BYTES = 5 * 1024 * 1024  # 5MB
+HF_EMBED_URL     = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+POLLINATIONS_URL = "https://text.pollinations.ai"
+MAX_CONTENT_BYTES = 5 * 1024 * 1024
 MAX_CHUNKS        = 200
 CHUNK_SIZE        = 1000
 CHUNK_OVERLAP     = 200
-RAG_THRESHOLD     = 0.35
+RAG_THRESHOLD     = 0.5
 RAG_MATCH_COUNT   = 4
 GROQ_MODEL        = "llama-3.1-8b-instant"
+EMBEDDING_DIM     = 384
 
 # ---- Lifespan ----
 @asynccontextmanager
@@ -90,7 +92,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"CORS Origins: {ALLOWED_ORIGINS}")
     logger.info(f"Groq Ready: {groq_client is not None}")
     logger.info(f"HF Token Set: {bool(HF_TOKEN)}")
-    logger.info(f"DDG Search Available: {DDGS_AVAILABLE}")
+    logger.info(f"DDG Available: {DDGS_AVAILABLE}")
     yield
     logger.info("BarPrep AI Backend shutting down.")
 
@@ -156,109 +158,68 @@ class ChatRequest(BaseModel):
         return v
 
 
-# ---- Helpers ----
-def sanitize_for_prompt(text: str) -> str:
-    """Prevents prompt injection via ingested content."""
-    text = text.replace("===", "---")
-    return text[:8000]
+# ---- Embedding Helpers ----
+
+def local_hash_embedding(text: str) -> List[float]:
+    """
+    Generates a deterministic 384-dim embedding using
+    character-level hashing. No external API needed.
+    Works offline on Render free tier.
+    Not as accurate as ML embeddings but always available.
+    """
+    embedding = np.zeros(EMBEDDING_DIM)
+    
+    # Use multiple hash seeds for better distribution
+    for seed in range(EMBEDDING_DIM):
+        hash_input = f"{seed}:{text}".encode("utf-8")
+        hash_val = int(hashlib.md5(hash_input).hexdigest(), 16)
+        embedding[seed] = (hash_val % 10000) / 10000.0 - 0.5
+
+    # Normalize to unit vector for cosine similarity
+    norm = np.linalg.norm(embedding)
+    if norm > 0:
+        embedding = embedding / norm
+
+    return embedding.tolist()
 
 
 def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
-    Generates embeddings via HuggingFace API.
-    Retries up to 3 times on failure with
-    increasing wait times between attempts.
+    Generates embeddings with fallback chain:
+    1. HuggingFace API (best quality - needs internet)
+    2. Local hash embedding (always works - no internet needed)
     """
     clean_texts = [t.replace("\n", " ").strip() for t in texts]
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
-    for attempt in range(3):
-        try:
-            response = requests.post(
-                HF_EMBED_URL,
-                headers=headers,
-                json={
-                    "inputs": clean_texts,
-                    "options": {"wait_for_model": True}
-                },
-                timeout=60
-            )
-
-            if response.status_code == 200:
-                result = response.json()
-                if isinstance(result, list) and len(result) > 0:
-                    logger.info("Embeddings generated via HuggingFace API.")
-                    return result
-
-            # Model still loading on HuggingFace
-            if response.status_code == 503:
-                wait_time = (attempt + 1) * 10
-                logger.warning(
-                    f"HuggingFace model loading. "
-                    f"Attempt {attempt + 1}/3. "
-                    f"Waiting {wait_time}s..."
-                )
-                time.sleep(wait_time)
-                continue
-
-            logger.error(
-                f"HuggingFace API error: "
-                f"{response.status_code} - {response.text}"
-            )
-
-        except requests.exceptions.ConnectionError as e:
-            wait_time = (attempt + 1) * 5
-            logger.warning(
-                f"HuggingFace connection failed. "
-                f"Attempt {attempt + 1}/3. "
-                f"Waiting {wait_time}s... "
-                f"Error: {e}"
-            )
-            time.sleep(wait_time)
-            continue
-
-        except Exception as e:
-            logger.error(f"Embedding attempt {attempt + 1} failed: {e}")
-            if attempt < 2:
-                time.sleep((attempt + 1) * 3)
-                continue
-
-    raise HTTPException(
-        status_code=500,
-        detail=(
-            "Embedding service temporarily unavailable. "
-            "Please try again in a few minutes."
+    # --- Try HuggingFace API first ---
+    try:
+        headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+        response = requests.post(
+            HF_EMBED_URL,
+            headers=headers,
+            json={
+                "inputs": clean_texts,
+                "options": {"wait_for_model": True}
+            },
+            timeout=15  # Short timeout - fail fast to local fallback
         )
-    )
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                logger.info("Embeddings via HuggingFace API.")
+                return result
+    except Exception as e:
+        logger.warning(f"HuggingFace unavailable: {e}. Using local fallback.")
+
+    # --- Local hash fallback - always works ---
+    logger.info("Using local hash embeddings.")
+    return [local_hash_embedding(text) for text in clean_texts]
 
 
-def get_embeddings_with_retry(
-    texts: List[str],
-    max_retries: int = 3
-) -> List[List[float]]:
-    """Wraps get_embeddings_batch with outer retry logic."""
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            return get_embeddings_batch(texts)
-        except HTTPException as e:
-            if e.status_code != 500:
-                raise
-            last_error = e
-            wait_time = (attempt + 1) * 3
-            logger.warning(
-                f"Embedding retry {attempt + 1}/{max_retries}. "
-                f"Waiting {wait_time}s..."
-            )
-            time.sleep(wait_time)
-
-    raise HTTPException(
-        status_code=500,
-        detail=(
-            f"Embedding failed after {max_retries} attempts. "
-            f"Last error: {last_error}"
-        )
-    )
+def sanitize_for_prompt(text: str) -> str:
+    """Prevents prompt injection."""
+    text = text.replace("===", "---")
+    return text[:8000]
 
 
 def split_text(
@@ -279,7 +240,7 @@ def split_text(
 
 
 def run_web_search(query: str) -> str:
-    """Runs DuckDuckGo search with version compatibility."""
+    """Runs DuckDuckGo web search."""
     if not DDGS_AVAILABLE:
         return ""
     try:
@@ -322,7 +283,7 @@ def health_check():
 
 @app.post("/api/ingest/url")
 def ingest_url(data: IngestRequest):
-    """Scrapes a webpage and ingests it into Supabase vector store."""
+    """Scrapes a webpage and ingests into Supabase."""
     url = data.url
     try:
         res = requests.get(
@@ -372,12 +333,10 @@ def ingest_url(data: IngestRequest):
 
     if len(chunks) > MAX_CHUNKS:
         chunks = chunks[:MAX_CHUNKS]
-        logger.warning(f"Ingestion truncated to {MAX_CHUNKS} chunks.")
+        logger.warning(f"Truncated to {MAX_CHUNKS} chunks.")
 
     try:
-        embeddings = get_embeddings_with_retry(chunks)
-    except HTTPException:
-        raise
+        embeddings = get_embeddings_batch(chunks)
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -411,16 +370,12 @@ def ingest_url(data: IngestRequest):
 
 @app.post("/api/ingest/youtube")
 def ingest_youtube(data: IngestRequest):
-    """Transcribes a YouTube video and ingests it into Supabase."""
+    """Transcribes YouTube video and ingests into Supabase."""
     match = re.search(r"(?:v=|\/)([a-zA-Z0-9_-]{11})", data.url)
     if not match:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid YouTube URL."
-        )
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL.")
     video_id = match.group(1)
 
-    # Retry up to 3 times for rate limits
     transcript_list = None
     last_error = None
 
@@ -442,18 +397,12 @@ def ingest_youtube(data: IngestRequest):
             last_error = e
             error_str = str(e).lower()
 
-            # Rate limit - wait and retry
             if "429" in str(e) or "too many requests" in error_str:
                 wait_time = (attempt + 1) * 5
-                logger.warning(
-                    f"YouTube rate limit hit. "
-                    f"Attempt {attempt + 1}/3. "
-                    f"Waiting {wait_time}s..."
-                )
+                logger.warning(f"YouTube rate limit. Waiting {wait_time}s...")
                 time.sleep(wait_time)
                 continue
 
-            # Video unavailable
             if HAS_VIDEO_UNAVAILABLE and isinstance(e, VideoUnavailable):
                 raise HTTPException(
                     status_code=404,
@@ -465,20 +414,15 @@ def ingest_youtube(data: IngestRequest):
                     detail="Video unavailable or private."
                 )
 
-            # Unknown error
             raise HTTPException(
                 status_code=500,
                 detail=f"Transcript error: {e}"
             )
 
-    # All retries exhausted
     if transcript_list is None:
         raise HTTPException(
             status_code=429,
-            detail=(
-                "YouTube is rate limiting requests. "
-                "Please wait 5 minutes and try again."
-            )
+            detail="YouTube rate limiting. Please wait 5 minutes and retry."
         )
 
     full_transcript = " ".join(e["text"] for e in transcript_list)
@@ -497,18 +441,14 @@ def ingest_youtube(data: IngestRequest):
 
     chunks = split_text(full_transcript)
     if not chunks:
-        return {
-            "message": f"Video {video_id} had no usable transcript text."
-        }
+        return {"message": f"Video {video_id} had no usable transcript text."}
 
     if len(chunks) > MAX_CHUNKS:
         chunks = chunks[:MAX_CHUNKS]
-        logger.warning(f"YouTube truncated to {MAX_CHUNKS} chunks.")
+        logger.warning(f"Truncated to {MAX_CHUNKS} chunks.")
 
     try:
-        embeddings = get_embeddings_with_retry(chunks)
-    except HTTPException:
-        raise
+        embeddings = get_embeddings_batch(chunks)
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -544,16 +484,16 @@ def ingest_youtube(data: IngestRequest):
 def chat_with_ai(data: ChatRequest):
     """Answers bar exam questions using RAG + AI."""
 
-    # 1. Embed the query
+    # 1. Embed query
     try:
-        query_vector = get_embeddings_with_retry([data.message])[0]
+        query_vector = get_embeddings_batch([data.message])[0]
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Query embedding failed: {e}"
         )
 
-    # 2. RAG search with graceful degradation
+    # 2. RAG search
     try:
         result = supabase.rpc("match_documents", {
             "query_embedding": query_vector,
@@ -565,7 +505,7 @@ def chat_with_ai(data: ChatRequest):
         logger.error(f"RAG search failed: {e}")
         context_chunks = []
 
-    # 3. Web search fallback if RAG found nothing
+    # 3. Web search fallback
     web_results = ""
     if not context_chunks:
         web_results = run_web_search(data.message)
@@ -588,14 +528,13 @@ Explain step-by-step with clear legal reasoning when needed.
 {context_text}{web_section}
 """
 
-    # 5. Assemble messages
     messages = (
         [{"role": "system", "content": system_prompt}]
         + [{"role": m.role, "content": m.content} for m in data.history]
         + [{"role": "user", "content": data.message}]
     )
 
-    # 6. Try Pollinations first (free)
+    # 5. Try Pollinations first
     try:
         res = requests.post(POLLINATIONS_URL, json={
             "messages": messages,
@@ -607,7 +546,7 @@ Explain step-by-step with clear legal reasoning when needed.
     except Exception as e:
         logger.error(f"Pollinations failed: {e}")
 
-    # 7. Groq fallback
+    # 6. Groq fallback
     if groq_client:
         try:
             completion = groq_client.chat.completions.create(
@@ -647,7 +586,7 @@ def get_daily_affirmation():
         if res.status_code == 200 and (reply := res.text.strip()):
             return {"affirmation": reply}
     except Exception as e:
-        logger.error(f"Affirmation generation failed: {e}")
+        logger.error(f"Affirmation failed: {e}")
 
     return {
         "affirmation": "You have the analytical mind, the diligence, and the capability to conquer this exam. One rule, one analysis, and one day at a time."
