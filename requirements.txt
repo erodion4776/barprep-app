@@ -12,18 +12,18 @@ supabase~=2.4.0
 # ===========================
 # AI / LLM Providers
 # ===========================
-groq~=0.9.0                      # Was missing! Groq LLM fallback
+groq~=0.9.0
 
 # ===========================
-# Embeddings & Search
+# Search - downgraded to avoid Rust dependency
 # ===========================
-duckduckgo-search~=6.1.7
+duckduckgo-search==3.9.6
 
 # ===========================
 # Web Scraping
 # ===========================
 beautifulsoup4~=4.12.3
-lxml~=5.2.0                      # Was missing! Fast BS4 parser
+lxml~=5.2.0
 requests~=2.31.0
 
 # ===========================
