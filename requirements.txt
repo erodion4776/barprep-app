@@ -8,6 +8,9 @@ supabase==2.10.0
 # AI / LLM Providers
 groq==0.13.1
 
+# Embeddings - lightweight local only
+numpy==1.26.4
+
 # Search
 duckduckgo-search==3.9.6
 
