@@ -1,9 +1,27 @@
+# Web Framework
 fastapi==0.115.5
 uvicorn==0.32.1
+
+# Database
 supabase==2.10.0
+
+# AI
 groq==0.13.1
+
+# Search
+duckduckgo-search==3.9.6
+
+# Web Scraping
+beautifulsoup4==4.12.3
+lxml==5.3.0
+requests==2.32.3
+
+# YouTube
 youtube-transcript-api==0.6.2
 google-api-python-client==2.111.0
+
+# Utilities
 python-dotenv==1.0.1
-requests==2.32.3
+pydantic==2.10.3
+typing-extensions==4.12.2
 numpy==1.26.4
